@@ -4,6 +4,8 @@ from dotenv import load_dotenv
 from routes.chat import router as chat_router
 from routes.file import router as file_router
 from routes.history import router as history_router
+from routes.profile import router as profile_router
+from routes.memory import router as memory_router
 
 
 load_dotenv()
@@ -25,6 +27,8 @@ app.add_middleware(
 app.include_router(chat_router, prefix="/api/v1")
 app.include_router(file_router, prefix="/api/v1")
 app.include_router(history_router, prefix="/api/v1")
+app.include_router(profile_router, prefix="/api/v1")
+app.include_router(memory_router, prefix="/api/v1")
 
 @app.get("/")
 async def root():

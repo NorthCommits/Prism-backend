@@ -10,6 +10,7 @@ from db.conversations import (
 )
 from db.messages import save_message, get_messages
 from db.auth import verify_token
+import asyncio
 
 router = APIRouter()
 
@@ -82,7 +83,7 @@ async def save_msg(
     user_id: str = Depends(verify_token)
 ):
     try:
-        return save_message(
+        result = save_message(
             conversation_id=request.conversation_id,
             role=request.role,
             content=request.content,
@@ -94,6 +95,24 @@ async def save_msg(
             file_used=request.file_used,
             file_name=request.file_name,
         )
+
+        # trigger memory extraction after every 4th assistant message
+        # runs in background so it doesn't slow down the response
+        if request.role == "assistant":
+            all_messages = get_messages(request.conversation_id)
+            if len(all_messages) % 4 == 0:
+                from routes.memory import extract_memories_from_conversation
+                asyncio.create_task(
+                    extract_memories_from_conversation(
+                        [{"role": m["role"], "content": m["content"]}
+                         for m in all_messages],
+                        request.conversation_id,
+                        user_id
+                    )
+                )
+
+        return result
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -107,4 +126,4 @@ async def delete_conv(
         delete_conversation(conversation_id, user_id)
         return {"success": True}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) 
+        raise HTTPException(status_code=500, detail=str(e))

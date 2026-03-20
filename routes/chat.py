@@ -10,6 +10,17 @@ from routes.router import route_message
 from routes.search import web_search
 from routes.image import generate_plot_json, generate_dalle_image
 from routes.sandbox import execute_code
+from routes.context import build_smart_context
+from routes.profile import get_profile_by_user_id, build_profile_context
+from routes.memory import get_user_memories, build_memory_context
+
+VISION_MODEL = "openai/gpt-4o"
+
+CUSTOM_INSTRUCTIONS_ADDENDUM = """
+--- USER PROFILE & CUSTOM INSTRUCTIONS ---
+{profile_context}
+--- END OF USER PROFILE ---
+"""
 
 router = APIRouter()
 
@@ -40,6 +51,7 @@ File type: {file_type}
 class HistoryMessage(BaseModel):
     role: str
     content: str
+    model_id: Optional[str] = None
 
 
 class ChatRequest(BaseModel):
@@ -49,6 +61,9 @@ class ChatRequest(BaseModel):
     file_name: Optional[str] = None
     file_type: Optional[str] = None
     file_content: Optional[str] = None
+    user_id: Optional[str] = None
+    image_base64: Optional[str] = None
+    image_media_type: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -63,6 +78,7 @@ class ChatResponse(BaseModel):
     search_used: Optional[bool] = None
     search_query: Optional[str] = None
     file_used: Optional[bool] = None
+    image_used: Optional[bool] = None
 
 
 async def stream_response(
@@ -126,11 +142,14 @@ async def chat(request: ChatRequest):
     execution_code = ""
     execution_language = "python"
     file_used = False
+    image_used = False
 
     # combine message with file context for routing
     routing_message = request.message
     if request.file_content:
         routing_message = f"{request.message} [User has uploaded a file: {request.file_name}]"
+    if request.image_base64:
+        routing_message = f"{request.message} [User has uploaded an image]"
 
     # auto routing
     if request.model_id == "auto":
@@ -150,7 +169,7 @@ async def chat(request: ChatRequest):
         )
 
     # handle plot request — run web search first if needed for real data
-    if needs_plot:
+    if needs_plot and not request.image_base64:
         plot_context = request.message
         if needs_web_search and search_query:
             search_results = await web_search(search_query)
@@ -178,8 +197,8 @@ async def chat(request: ChatRequest):
                 file_used=False
             )
 
-    # handle image request
-    if needs_image:
+    # handle image generation request (not vision)
+    if needs_image and not request.image_base64:
         prompt = image_prompt or request.message
         image_url = await generate_dalle_image(prompt)
         if image_url:
@@ -196,7 +215,7 @@ async def chat(request: ChatRequest):
             )
 
     # handle code execution request
-    if needs_execution and execution_code:
+    if needs_execution and execution_code and not request.image_base64:
         result = await execute_code(execution_code, execution_language)
 
         output_lines = []
@@ -234,8 +253,26 @@ async def chat(request: ChatRequest):
         )
         file_used = True
 
+    # inject user profile + custom instructions if available
+    if request.user_id:
+        profile = await get_profile_by_user_id(request.user_id)
+        if profile:
+            profile_context = build_profile_context(profile)
+            if profile_context:
+                system_prompt += "\n\n" + CUSTOM_INSTRUCTIONS_ADDENDUM.format(
+                    profile_context=profile_context
+                )
+
+    # inject cross-conversation memories if user_id provided
+    if request.user_id:
+        memories = await get_user_memories(request.user_id)
+        if memories:
+            memory_context = build_memory_context(memories)
+            if memory_context:
+                system_prompt += "\n\n" + memory_context
+
     # inject web search results if needed
-    if needs_web_search and search_query:
+    if needs_web_search and search_query and not request.image_base64:
         search_results = await web_search(search_query)
         if search_results:
             system_prompt += "\n\n" + WEB_SEARCH_SYSTEM_ADDENDUM.format(
@@ -243,25 +280,66 @@ async def chat(request: ChatRequest):
             )
             search_used = True
 
-    # build messages array with full conversation history
-    messages = [{"role": "system", "content": system_prompt}]
-    for msg in (request.conversation_history or []):
-        messages.append({"role": msg.role, "content": msg.content})
-    messages.append({"role": "user", "content": request.message})
+    # build smart context with compression
+    history_dicts = [
+        {
+            "role": msg.role,
+            "content": msg.content,
+            "model_id": msg.model_id
+        }
+        for msg in (request.conversation_history or [])
+    ]
+
+    messages = await build_smart_context(
+        conversation_history=history_dicts,
+        current_model_id=resolved_model_id,
+        system_prompt=system_prompt
+    )
+
+    # build user message — with or without image
+    if request.image_base64:
+        # vision request — use multimodal message format
+        media_type = request.image_media_type or "image/jpeg"
+        user_message = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{media_type};base64,{request.image_base64}"
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": request.message or "What is in this image?"
+                }
+            ]
+        }
+        messages.append(user_message)
+        image_used = True
+
+        # use vision model
+        selected_model = VISION_MODEL
+        routing_reason = "Image uploaded — using GPT-4o vision model"
+        routed_to = "coding"
+    else:
+        messages.append({"role": "user", "content": request.message})
+        selected_model = model_config.openrouter_model
 
     metadata = {
-        "model_name": model_config.name,
+        "model_name": "Vision Assistant" if image_used else model_config.name,
         "model_id": resolved_model_id,
         "response_type": "text",
         "routed_to": routed_to,
         "routing_reason": routing_reason,
         "search_used": search_used,
         "search_query": search_query if search_used else None,
-        "file_used": file_used
+        "file_used": file_used,
+        "image_used": image_used
     }
 
     return StreamingResponse(
-        stream_response(messages, model_config.openrouter_model, metadata),
+        stream_response(messages, selected_model, metadata),
         media_type="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
