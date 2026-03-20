@@ -10,8 +10,8 @@ ROUTER_MODEL = "openai/gpt-4o-mini"
 
 async def route_message(message: str) -> tuple:
     """
-    Returns (model_id, needs_web_search, needs_plot, needs_image, 
-             needs_execution, search_query, image_prompt, 
+    Returns (model_id, needs_web_search, needs_plot, needs_image,
+             needs_execution, needs_agent, search_query, image_prompt,
              execution_code, execution_language, reason)
     """
     headers = {
@@ -40,7 +40,7 @@ async def route_message(message: str) -> tuple:
             )
 
         if response.status_code != 200:
-            return "writing", False, False, False, False, "", "", "", "", "Fallback due to router error"
+            return "writing", False, False, False, False, False, "", "", "", "", "Fallback due to router error"
 
         data = response.json()
         content = data["choices"][0]["message"]["content"].strip()
@@ -52,6 +52,7 @@ async def route_message(message: str) -> tuple:
         needs_plot = result.get("needs_plot", False)
         needs_image = result.get("needs_image", False)
         needs_execution = result.get("needs_execution", False)
+        needs_agent = result.get("needs_agent", False)
         search_query = result.get("search_query", "")
         image_prompt = result.get("image_prompt", "")
         execution_code = result.get("execution_code", "")
@@ -59,8 +60,14 @@ async def route_message(message: str) -> tuple:
         reason = result.get("reason", "No reason provided")
 
         if model_id not in MODEL_REGISTRY:
-            return "writing", False, False, False, False, "", "", "", "", "Fallback: unknown model"
+            return "writing", False, False, False, False, False, "", "", "", "", "Fallback: unknown model"
 
+        # enforce mutual exclusivity
+        if needs_agent:
+            needs_plot = False
+            needs_image = False
+            needs_execution = False
+            needs_web_search = False
         if needs_plot and needs_image:
             needs_image = False
         if needs_execution:
@@ -68,8 +75,8 @@ async def route_message(message: str) -> tuple:
             needs_image = False
 
         return (model_id, needs_web_search, needs_plot, needs_image,
-                needs_execution, search_query, image_prompt,
+                needs_execution, needs_agent, search_query, image_prompt,
                 execution_code, execution_language, reason)
 
     except Exception:
-        return "writing", False, False, False, False, "", "", "", "", "Fallback due to unexpected error"
+        return "writing", False, False, False, False, False, "", "", "", "", "Fallback due to unexpected error"

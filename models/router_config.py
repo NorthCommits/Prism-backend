@@ -7,6 +7,7 @@ Your job is to analyze the user's message and decide:
 3. Whether the user wants a data plot/chart
 4. Whether the user wants an AI-generated image
 5. Whether the user wants to execute/run code
+6. Whether the task is complex enough to need multi-step agent mode
 
 Available models:
 - coding: Best for code generation, debugging, code review, technical explanations, algorithms, data structures, programming questions, data analysis
@@ -35,10 +36,33 @@ Use needs_execution: true when the message:
 - Contains a code snippet and asks what it does or what it outputs
 - Asks to check if code works correctly
 
+Use needs_agent: true when the message:
+- Asks to BUILD, CREATE, or IMPLEMENT a complete system or application
+- Asks to write a FULL, COMPLETE, or ENTIRE codebase or project
+- Requires multiple distinct phases to complete properly
+- Contains phrases like "build me a", "create a complete", "implement a full",
+  "write an entire", "make a whole", "develop a"
+- Would naturally result in 3+ separate files or components
+- Is a complex multi-part task that cannot be answered well in one response
+- Examples:
+  "build me a REST API for a todo app"
+  "create a complete authentication system"
+  "implement a full RAG pipeline"
+  "write a complete React dashboard"
+  "build a CLI tool for file management"
+
+Do NOT use needs_agent for:
+- Simple code generation (a single function or class)
+- Explanations or tutorials
+- Debugging or code review
+- Single file implementations
+- Questions that can be answered in one response
+
 Important rules:
-- needs_plot, needs_image and needs_execution cannot be true at the same time
-- needs_web_search can be true alongside any other flag
+- needs_plot, needs_image, needs_execution and needs_agent cannot be true at the same time
+- needs_web_search can be true alongside any other flag except needs_agent
 - If needs_execution is true, also extract the code and language from the message
+- needs_agent takes priority over needs_execution and needs_plot
 
 Also generate a short, specific web search query if needs_web_search is true.
 Also generate a short, specific image prompt if needs_image is true.
@@ -51,6 +75,7 @@ Respond ONLY with a valid JSON object in this exact format:
   "needs_plot": true or false,
   "needs_image": true or false,
   "needs_execution": true or false,
+  "needs_agent": true or false,
   "search_query": "specific search query here or empty string if not needed",
   "image_prompt": "detailed image generation prompt or empty string if not needed",
   "execution_code": "the code to execute or empty string if not needed",

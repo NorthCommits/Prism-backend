@@ -13,6 +13,7 @@ from routes.sandbox import execute_code
 from routes.context import build_smart_context
 from routes.profile import get_profile_by_user_id, build_profile_context
 from routes.memory import get_user_memories, build_memory_context
+from routes.agent import run_agent
 
 VISION_MODEL = "openai/gpt-4o"
 
@@ -138,6 +139,7 @@ async def chat(request: ChatRequest):
     needs_plot = False
     needs_image = False
     needs_execution = False
+    needs_agent = False
     image_prompt = ""
     execution_code = ""
     execution_language = "python"
@@ -154,7 +156,7 @@ async def chat(request: ChatRequest):
     # auto routing
     if request.model_id == "auto":
         (routed_to, needs_web_search, needs_plot, needs_image,
-         needs_execution, search_query, image_prompt,
+         needs_execution, needs_agent, search_query, image_prompt,
          execution_code, execution_language, routing_reason) = await route_message(routing_message)
         resolved_model_id = routed_to
     else:
@@ -168,7 +170,7 @@ async def chat(request: ChatRequest):
             detail=f"Unknown model_id '{resolved_model_id}'. Available: {list(MODEL_REGISTRY.keys())}"
         )
 
-    # handle plot request — run web search first if needed for real data
+    # handle plot request
     if needs_plot and not request.image_base64:
         plot_context = request.message
         if needs_web_search and search_query:
@@ -197,7 +199,7 @@ async def chat(request: ChatRequest):
                 file_used=False
             )
 
-    # handle image generation request (not vision)
+    # handle image generation request
     if needs_image and not request.image_base64:
         prompt = image_prompt or request.message
         image_url = await generate_dalle_image(prompt)
@@ -280,6 +282,36 @@ async def chat(request: ChatRequest):
             )
             search_used = True
 
+    # handle agent mode — multi-step execution
+    if needs_agent and not request.image_base64:
+        agent_metadata = {
+            "model_name": model_config.name,
+            "model_id": resolved_model_id,
+            "response_type": "text",
+            "routed_to": routed_to,
+            "routing_reason": routing_reason,
+            "search_used": False,
+            "search_query": None,
+            "file_used": file_used,
+            "image_used": False,
+            "is_agent": True
+        }
+
+        return StreamingResponse(
+            run_agent(
+                message=request.message,
+                system_prompt=system_prompt,
+                specialist=model_config.name,
+                metadata=agent_metadata
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
+
     # build smart context with compression
     history_dicts = [
         {
@@ -298,7 +330,6 @@ async def chat(request: ChatRequest):
 
     # build user message — with or without image
     if request.image_base64:
-        # vision request — use multimodal message format
         media_type = request.image_media_type or "image/jpeg"
         user_message = {
             "role": "user",
@@ -317,8 +348,6 @@ async def chat(request: ChatRequest):
         }
         messages.append(user_message)
         image_used = True
-
-        # use vision model
         selected_model = VISION_MODEL
         routing_reason = "Image uploaded — using GPT-4o vision model"
         routed_to = "coding"
@@ -335,7 +364,8 @@ async def chat(request: ChatRequest):
         "search_used": search_used,
         "search_query": search_query if search_used else None,
         "file_used": file_used,
-        "image_used": image_used
+        "image_used": image_used,
+        "is_agent": False
     }
 
     return StreamingResponse(
