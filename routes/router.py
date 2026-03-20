@@ -8,10 +8,11 @@ OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 ROUTER_MODEL = "openai/gpt-4o-mini"
 
 
-async def route_message(message: str) -> tuple[str, bool, bool, bool, str, str, str]:
+async def route_message(message: str) -> tuple:
     """
-    Returns (model_id, needs_web_search, needs_plot, needs_image, search_query, image_prompt, reason)
-    Falls back to ("writing", False, False, False, "", "", "fallback") if routing fails.
+    Returns (model_id, needs_web_search, needs_plot, needs_image, 
+             needs_execution, search_query, image_prompt, 
+             execution_code, execution_language, reason)
     """
     headers = {
         "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
@@ -27,7 +28,7 @@ async def route_message(message: str) -> tuple[str, bool, bool, bool, str, str, 
             {"role": "user", "content": ROUTER_USER_PROMPT.format(message=message)}
         ],
         "temperature": 0,
-        "max_tokens": 200
+        "max_tokens": 300
     }
 
     try:
@@ -39,12 +40,10 @@ async def route_message(message: str) -> tuple[str, bool, bool, bool, str, str, 
             )
 
         if response.status_code != 200:
-            return "writing", False, False, False, "", "", "Fallback due to router error"
+            return "writing", False, False, False, False, "", "", "", "", "Fallback due to router error"
 
         data = response.json()
         content = data["choices"][0]["message"]["content"].strip()
-
-        # clean markdown fences if model wraps in ```json
         content = content.replace("```json", "").replace("```", "").strip()
 
         result = json.loads(content)
@@ -52,19 +51,25 @@ async def route_message(message: str) -> tuple[str, bool, bool, bool, str, str, 
         needs_web_search = result.get("needs_web_search", False)
         needs_plot = result.get("needs_plot", False)
         needs_image = result.get("needs_image", False)
+        needs_execution = result.get("needs_execution", False)
         search_query = result.get("search_query", "")
         image_prompt = result.get("image_prompt", "")
+        execution_code = result.get("execution_code", "")
+        execution_language = result.get("execution_language", "python")
         reason = result.get("reason", "No reason provided")
 
-        # validate model_id is actually registered
         if model_id not in MODEL_REGISTRY:
-            return "writing", False, False, False, "", "", "Fallback: unknown model returned by router"
+            return "writing", False, False, False, False, "", "", "", "", "Fallback: unknown model"
 
-        # enforce mutual exclusivity
         if needs_plot and needs_image:
             needs_image = False
+        if needs_execution:
+            needs_plot = False
+            needs_image = False
 
-        return model_id, needs_web_search, needs_plot, needs_image, search_query, image_prompt, reason
+        return (model_id, needs_web_search, needs_plot, needs_image,
+                needs_execution, search_query, image_prompt,
+                execution_code, execution_language, reason)
 
     except Exception:
-        return "writing", False, False, False, "", "", "Fallback due to unexpected router error"
+        return "writing", False, False, False, False, "", "", "", "", "Fallback due to unexpected error"

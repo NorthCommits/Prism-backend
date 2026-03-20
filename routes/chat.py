@@ -1,12 +1,15 @@
 import httpx
 import os
+import json
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List
 from models.config import MODEL_REGISTRY
 from routes.router import route_message
 from routes.search import web_search
 from routes.image import generate_plot_json, generate_dalle_image
+from routes.sandbox import execute_code
 
 router = APIRouter()
 
@@ -52,7 +55,7 @@ class ChatResponse(BaseModel):
     reply: str
     model_name: str
     model_id: str
-    response_type: str = "text"  # "text", "plot", "image"
+    response_type: str = "text"
     plot_json: Optional[dict] = None
     image_url: Optional[str] = None
     routed_to: Optional[str] = None
@@ -62,7 +65,54 @@ class ChatResponse(BaseModel):
     file_used: Optional[bool] = None
 
 
-@router.post("/chat", response_model=ChatResponse)
+async def stream_response(
+    messages: list,
+    model: str,
+    metadata: dict
+):
+    headers = {
+        "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/prism-ai",
+        "X-Title": "Prism"
+    }
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": True
+    }
+
+    yield f"data: {json.dumps({'type': 'metadata', **metadata})}\n\n"
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        async with client.stream(
+            "POST",
+            OPENROUTER_API_URL,
+            json=payload,
+            headers=headers
+        ) as response:
+            if response.status_code != 200:
+                error = await response.aread()
+                yield f"data: {json.dumps({'type': 'error', 'message': error.decode()})}\n\n"
+                return
+
+            async for line in response.aiter_lines():
+                if line.startswith("data: "):
+                    data = line[6:]
+                    if data == "[DONE]":
+                        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                        return
+                    try:
+                        chunk = json.loads(data)
+                        delta = chunk["choices"][0]["delta"]
+                        if "content" in delta and delta["content"]:
+                            yield f"data: {json.dumps({'type': 'token', 'content': delta['content']})}\n\n"
+                    except Exception:
+                        continue
+
+
+@router.post("/chat")
 async def chat(request: ChatRequest):
     routed_to = None
     routing_reason = None
@@ -71,7 +121,10 @@ async def chat(request: ChatRequest):
     needs_web_search = False
     needs_plot = False
     needs_image = False
+    needs_execution = False
     image_prompt = ""
+    execution_code = ""
+    execution_language = "python"
     file_used = False
 
     # combine message with file context for routing
@@ -81,7 +134,9 @@ async def chat(request: ChatRequest):
 
     # auto routing
     if request.model_id == "auto":
-        routed_to, needs_web_search, needs_plot, needs_image, search_query, image_prompt, routing_reason = await route_message(routing_message)
+        (routed_to, needs_web_search, needs_plot, needs_image,
+         needs_execution, search_query, image_prompt,
+         execution_code, execution_language, routing_reason) = await route_message(routing_message)
         resolved_model_id = routed_to
     else:
         resolved_model_id = request.model_id
@@ -94,10 +149,21 @@ async def chat(request: ChatRequest):
             detail=f"Unknown model_id '{resolved_model_id}'. Available: {list(MODEL_REGISTRY.keys())}"
         )
 
-    # handle plot request
+    # handle plot request — run web search first if needed for real data
     if needs_plot:
+        plot_context = request.message
+        if needs_web_search and search_query:
+            search_results = await web_search(search_query)
+            if search_results:
+                plot_context = (
+                    f"{request.message}\n\n"
+                    f"Use this real data from web search to populate the chart:\n"
+                    f"{search_results}"
+                )
+                search_used = True
+
         history = [{"role": m.role, "content": m.content} for m in (request.conversation_history or [])]
-        plot_json = await generate_plot_json(request.message, history)
+        plot_json = await generate_plot_json(plot_context, history)
         if plot_json:
             return ChatResponse(
                 reply="Here is your chart.",
@@ -107,7 +173,8 @@ async def chat(request: ChatRequest):
                 plot_json=plot_json,
                 routed_to=routed_to,
                 routing_reason=routing_reason,
-                search_used=False,
+                search_used=search_used,
+                search_query=search_query if search_used else None,
                 file_used=False
             )
 
@@ -127,6 +194,33 @@ async def chat(request: ChatRequest):
                 search_used=False,
                 file_used=False
             )
+
+    # handle code execution request
+    if needs_execution and execution_code:
+        result = await execute_code(execution_code, execution_language)
+
+        output_lines = []
+        if result["stdout"]:
+            output_lines.append(f"**Output:**\n```\n{result['stdout'].strip()}\n```")
+        if result["stderr"]:
+            output_lines.append(f"**Errors:**\n```\n{result['stderr'].strip()}\n```")
+        if result["timed_out"]:
+            output_lines.append("**Execution timed out after 10 seconds.**")
+        if not output_lines:
+            output_lines.append("**No output produced.**")
+
+        execution_output = "\n\n".join(output_lines)
+
+        return ChatResponse(
+            reply=execution_output,
+            model_name=model_config.name,
+            model_id=resolved_model_id,
+            response_type="text",
+            routed_to=routed_to,
+            routing_reason=routing_reason,
+            search_used=False,
+            file_used=False
+        )
 
     # build system prompt
     system_prompt = model_config.system_prompt
@@ -149,46 +243,29 @@ async def chat(request: ChatRequest):
             )
             search_used = True
 
-    headers = {
-        "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://github.com/prism-ai",
-        "X-Title": "Prism"
-    }
-
     # build messages array with full conversation history
     messages = [{"role": "system", "content": system_prompt}]
-
     for msg in (request.conversation_history or []):
         messages.append({"role": msg.role, "content": msg.content})
-
     messages.append({"role": "user", "content": request.message})
 
-    payload = {
-        "model": model_config.openrouter_model,
-        "messages": messages
+    metadata = {
+        "model_name": model_config.name,
+        "model_id": resolved_model_id,
+        "response_type": "text",
+        "routed_to": routed_to,
+        "routing_reason": routing_reason,
+        "search_used": search_used,
+        "search_query": search_query if search_used else None,
+        "file_used": file_used
     }
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        response = await client.post(OPENROUTER_API_URL, json=payload, headers=headers)
-
-    if response.status_code != 200:
-        raise HTTPException(
-            status_code=response.status_code,
-            detail=f"OpenRouter error: {response.text}"
-        )
-
-    data = response.json()
-    reply = data["choices"][0]["message"]["content"]
-
-    return ChatResponse(
-        reply=reply,
-        model_name=model_config.name,
-        model_id=resolved_model_id,
-        response_type="text",
-        routed_to=routed_to,
-        routing_reason=routing_reason,
-        search_used=search_used,
-        search_query=search_query if search_used else None,
-        file_used=file_used
+    return StreamingResponse(
+        stream_response(messages, model_config.openrouter_model, metadata),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
     )
