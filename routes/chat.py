@@ -15,6 +15,7 @@ from routes.profile import get_profile_by_user_id, build_profile_context
 from routes.memory import get_user_memories, build_memory_context
 from routes.agent import run_agent
 from routes.templates import get_template_system_prompt
+from routes.projects import get_project_context
 
 VISION_MODEL = "openai/gpt-4o"
 
@@ -22,6 +23,12 @@ CUSTOM_INSTRUCTIONS_ADDENDUM = """
 --- USER PROFILE & CUSTOM INSTRUCTIONS ---
 {profile_context}
 --- END OF USER PROFILE ---
+"""
+
+PROJECT_CONTEXT_ADDENDUM = """
+--- PROJECT CONTEXT ---
+{project_context}
+--- END OF PROJECT CONTEXT ---
 """
 
 router = APIRouter()
@@ -67,6 +74,7 @@ class ChatRequest(BaseModel):
     image_base64: Optional[str] = None
     image_media_type: Optional[str] = None
     active_template: Optional[str] = None
+    project_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -83,6 +91,7 @@ class ChatResponse(BaseModel):
     file_used: Optional[bool] = None
     image_used: Optional[bool] = None
     active_template: Optional[str] = None
+    project_id: Optional[str] = None
 
 
 async def stream_response(
@@ -203,7 +212,7 @@ async def chat(request: ChatRequest):
             )
 
     # handle image generation request
-    if needs_image and not request.image_base64:
+    if needs_image and not request.image_base64 and not request.active_template:
         prompt = image_prompt or request.message
         image_url = await generate_dalle_image(prompt)
         if image_url:
@@ -255,6 +264,18 @@ async def chat(request: ChatRequest):
         if template_prompt:
             system_prompt = template_prompt + "\n\n" + system_prompt
 
+    # inject project context if project_id provided
+    if request.project_id and request.user_id:
+        project_context = await get_project_context(
+            request.project_id,
+            request.user_id
+        )
+        if project_context:
+            system_prompt += "\n\n" + PROJECT_CONTEXT_ADDENDUM.format(
+                project_context=project_context
+            )
+            print(f"Injected project context for project {request.project_id}")
+
     # inject file content if provided
     if request.file_content and request.file_name:
         system_prompt += "\n\n" + FILE_CONTEXT_ADDENDUM.format(
@@ -304,7 +325,8 @@ async def chat(request: ChatRequest):
             "file_used": file_used,
             "image_used": False,
             "is_agent": True,
-            "active_template": request.active_template
+            "active_template": request.active_template,
+            "project_id": request.project_id
         }
 
         return StreamingResponse(
@@ -376,7 +398,8 @@ async def chat(request: ChatRequest):
         "file_used": file_used,
         "image_used": image_used,
         "is_agent": False,
-        "active_template": request.active_template
+        "active_template": request.active_template,
+        "project_id": request.project_id
     }
 
     return StreamingResponse(

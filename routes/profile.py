@@ -12,6 +12,7 @@ class UserProfile(BaseModel):
     about_you: Optional[str] = None
     custom_instructions: Optional[str] = None
     response_style: Optional[str] = "balanced"
+    onboarding_completed: Optional[bool] = False
 
 
 class UserProfileResponse(BaseModel):
@@ -21,6 +22,7 @@ class UserProfileResponse(BaseModel):
     about_you: Optional[str] = None
     custom_instructions: Optional[str] = None
     response_style: Optional[str] = "balanced"
+    onboarding_completed: Optional[bool] = False
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
@@ -36,7 +38,6 @@ async def get_profile(user_id: str = Depends(verify_token)):
             .execute()
         )
         if not response.data:
-            # return empty profile if not set yet
             return UserProfileResponse(user_id=user_id)
         return UserProfileResponse(**response.data[0])
     except Exception as e:
@@ -51,7 +52,6 @@ async def upsert_profile(
     try:
         client = get_supabase()
 
-        # check if profile exists
         existing = (
             client.table("user_profiles")
             .select("id")
@@ -67,8 +67,11 @@ async def upsert_profile(
             "response_style": profile.response_style or "balanced"
         }
 
+        # only update onboarding_completed if explicitly provided
+        if profile.onboarding_completed is not None:
+            data["onboarding_completed"] = profile.onboarding_completed
+
         if existing.data:
-            # update existing
             response = (
                 client.table("user_profiles")
                 .update(data)
@@ -76,7 +79,6 @@ async def upsert_profile(
                 .execute()
             )
         else:
-            # create new
             response = (
                 client.table("user_profiles")
                 .insert(data)
@@ -87,6 +89,39 @@ async def upsert_profile(
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/profile/complete-onboarding")
+async def complete_onboarding(user_id: str = Depends(verify_token)):
+    """
+    Marks onboarding as completed for the user.
+    Called when user finishes the onboarding flow.
+    """
+    try:
+        client = get_supabase()
+
+        existing = (
+            client.table("user_profiles")
+            .select("id")
+            .eq("user_id", user_id)
+            .execute()
+        )
+
+        if existing.data:
+            client.table("user_profiles").update({
+                "onboarding_completed": True
+            }).eq("user_id", user_id).execute()
+        else:
+            client.table("user_profiles").insert({
+                "user_id": user_id,
+                "onboarding_completed": True
+            }).execute()
+
+        return {"success": True}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 async def get_profile_by_user_id(user_id: Optional[str]) -> Optional[dict]:
     """
