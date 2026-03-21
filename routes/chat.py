@@ -14,6 +14,7 @@ from routes.context import build_smart_context
 from routes.profile import get_profile_by_user_id, build_profile_context
 from routes.memory import get_user_memories, build_memory_context
 from routes.agent import run_agent
+from routes.templates import get_template_system_prompt
 
 VISION_MODEL = "openai/gpt-4o"
 
@@ -65,6 +66,7 @@ class ChatRequest(BaseModel):
     user_id: Optional[str] = None
     image_base64: Optional[str] = None
     image_media_type: Optional[str] = None
+    active_template: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -80,6 +82,7 @@ class ChatResponse(BaseModel):
     search_query: Optional[str] = None
     file_used: Optional[bool] = None
     image_used: Optional[bool] = None
+    active_template: Optional[str] = None
 
 
 async def stream_response(
@@ -171,7 +174,7 @@ async def chat(request: ChatRequest):
         )
 
     # handle plot request
-    if needs_plot and not request.image_base64:
+    if needs_plot and not request.image_base64 and not request.active_template:
         plot_context = request.message
         if needs_web_search and search_query:
             search_results = await web_search(search_query)
@@ -217,7 +220,7 @@ async def chat(request: ChatRequest):
             )
 
     # handle code execution request
-    if needs_execution and execution_code and not request.image_base64:
+    if needs_execution and execution_code and not request.image_base64 and not request.active_template:
         result = await execute_code(execution_code, execution_language)
 
         output_lines = []
@@ -245,6 +248,12 @@ async def chat(request: ChatRequest):
 
     # build system prompt
     system_prompt = model_config.system_prompt
+
+    # inject template system prompt if active — takes highest priority
+    if request.active_template:
+        template_prompt = get_template_system_prompt(request.active_template)
+        if template_prompt:
+            system_prompt = template_prompt + "\n\n" + system_prompt
 
     # inject file content if provided
     if request.file_content and request.file_name:
@@ -283,7 +292,7 @@ async def chat(request: ChatRequest):
             search_used = True
 
     # handle agent mode — multi-step execution
-    if needs_agent and not request.image_base64:
+    if needs_agent and not request.image_base64 and not request.active_template:
         agent_metadata = {
             "model_name": model_config.name,
             "model_id": resolved_model_id,
@@ -294,7 +303,8 @@ async def chat(request: ChatRequest):
             "search_query": None,
             "file_used": file_used,
             "image_used": False,
-            "is_agent": True
+            "is_agent": True,
+            "active_template": request.active_template
         }
 
         return StreamingResponse(
@@ -365,7 +375,8 @@ async def chat(request: ChatRequest):
         "search_query": search_query if search_used else None,
         "file_used": file_used,
         "image_used": image_used,
-        "is_agent": False
+        "is_agent": False,
+        "active_template": request.active_template
     }
 
     return StreamingResponse(

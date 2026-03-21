@@ -37,16 +37,28 @@ def get_conversation(conversation_id: str, user_id: str) -> Optional[dict]:
     return response.data
 
 
-def update_conversation_title(conversation_id: str, title: str, user_id: str) -> dict:
+def update_conversation_title(
+    conversation_id: str,
+    title: str,
+    user_id: Optional[str] = None
+) -> dict:
+    """
+    Updates conversation title.
+    user_id is optional — when called from background tasks
+    (e.g. auto title generation) we only have conversation_id.
+    """
     client = get_supabase()
-    response = (
+    query = (
         client.table("conversations")
         .update({"title": title})
         .eq("id", conversation_id)
-        .eq("user_id", user_id)
-        .execute()
     )
-    return response.data[0]
+    # only filter by user_id if provided
+    if user_id:
+        query = query.eq("user_id", user_id)
+
+    response = query.execute()
+    return response.data[0] if response.data else {}
 
 
 def delete_conversation(conversation_id: str, user_id: str) -> None:
