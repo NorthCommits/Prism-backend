@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Query
 from pydantic import BaseModel
 from typing import Optional
 from db.conversations import (
@@ -10,6 +10,7 @@ from db.conversations import (
 )
 from db.messages import save_message, get_messages
 from db.auth import verify_token
+from db.supabase import get_supabase
 import asyncio
 import httpx
 import os
@@ -50,10 +51,6 @@ async def generate_conversation_title(
     assistant_message: str,
     conversation_id: str
 ) -> None:
-    """
-    Generates a smart title and updates the conversation in Supabase.
-    Runs in background — does not block response.
-    """
     try:
         headers = {
             "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
@@ -86,8 +83,6 @@ async def generate_conversation_title(
 
         data = response.json()
         title = data["choices"][0]["message"]["content"].strip()
-
-        # clean up any quotes
         title = title.strip('"').strip("'").strip()
 
         if title:
@@ -113,6 +108,118 @@ class SaveMessageRequest(BaseModel):
     search_query: Optional[str] = None
     file_used: bool = False
     file_name: Optional[str] = None
+
+
+@router.get("/search")
+async def search_conversations(
+    q: str = Query(..., min_length=1),
+    user_id: str = Depends(verify_token)
+):
+    """
+    Search through conversation titles and message content.
+    Returns matching conversations with relevant message snippets.
+    """
+    try:
+        if not q or not q.strip():
+            return []
+
+        query = q.strip().lower()
+        client = get_supabase()
+
+        # search conversation titles
+        title_results = (
+            client.table("conversations")
+            .select("id, title, created_at, updated_at")
+            .eq("user_id", user_id)
+            .ilike("title", f"%{query}%")
+            .order("updated_at", desc=True)
+            .limit(5)
+            .execute()
+        )
+
+        # search message content
+        message_results = (
+            client.table("messages")
+            .select("id, conversation_id, role, content, created_at")
+            .ilike("content", f"%{query}%")
+            .order("created_at", desc=True)
+            .limit(20)
+            .execute()
+        )
+
+        # build results map — conversation_id → best snippet
+        conv_snippets: dict = {}
+
+        for msg in (message_results.data or []):
+            conv_id = msg["conversation_id"]
+            if conv_id not in conv_snippets:
+                content = msg["content"]
+                # find the query position and extract snippet around it
+                idx = content.lower().find(query)
+                if idx != -1:
+                    start = max(0, idx - 60)
+                    end = min(len(content), idx + len(query) + 60)
+                    snippet = content[start:end].strip()
+                    if start > 0:
+                        snippet = "..." + snippet
+                    if end < len(content):
+                        snippet = snippet + "..."
+                    conv_snippets[conv_id] = {
+                        "snippet": snippet,
+                        "role": msg["role"]
+                    }
+
+        # fetch conversation details for message matches
+        matched_conv_ids = list(conv_snippets.keys())
+        message_conv_results = []
+
+        if matched_conv_ids:
+            for conv_id in matched_conv_ids[:10]:
+                conv = (
+                    client.table("conversations")
+                    .select("id, title, created_at, updated_at")
+                    .eq("id", conv_id)
+                    .eq("user_id", user_id)
+                    .execute()
+                )
+                if conv.data:
+                    message_conv_results.append(conv.data[0])
+
+        # merge results — title matches first, then message matches
+        seen_ids = set()
+        final_results = []
+
+        # add title matches
+        for conv in (title_results.data or []):
+            if conv["id"] not in seen_ids:
+                seen_ids.add(conv["id"])
+                final_results.append({
+                    "id": conv["id"],
+                    "title": conv["title"],
+                    "updated_at": conv["updated_at"],
+                    "match_type": "title",
+                    "snippet": None
+                })
+
+        # add message matches
+        for conv in message_conv_results:
+            if conv["id"] not in seen_ids:
+                seen_ids.add(conv["id"])
+                snippet_data = conv_snippets.get(conv["id"], {})
+                final_results.append({
+                    "id": conv["id"],
+                    "title": conv["title"],
+                    "updated_at": conv["updated_at"],
+                    "match_type": "message",
+                    "snippet": snippet_data.get("snippet"),
+                    "snippet_role": snippet_data.get("role")
+                })
+
+        return final_results[:10]
+
+    except Exception as e:
+        print(f"Search error: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/conversations")
@@ -181,7 +288,6 @@ async def save_msg(
         if request.role == "assistant":
             all_messages = get_messages(request.conversation_id)
 
-            # auto-generate title after first assistant message (2 total: user + assistant)
             if len(all_messages) == 2:
                 user_msg = next(
                     (m["content"] for m in all_messages if m["role"] == "user"),
@@ -195,7 +301,6 @@ async def save_msg(
                     )
                 )
 
-            # trigger memory extraction every 4th assistant message
             if len(all_messages) % 4 == 0:
                 from routes.memory import extract_memories_from_conversation
                 asyncio.create_task(
