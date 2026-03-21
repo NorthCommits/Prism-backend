@@ -8,6 +8,8 @@ from routes.profile import router as profile_router
 from routes.memory import router as memory_router
 from routes.templates import router as templates_router
 from routes.feedback import router as feedback_router
+from routes.demo import router as demo_router
+
 
 
 
@@ -34,6 +36,8 @@ app.include_router(profile_router, prefix="/api/v1")
 app.include_router(memory_router, prefix="/api/v1")
 app.include_router(templates_router, prefix="/api/v1")
 app.include_router(feedback_router, prefix="/api/v1")
+app.include_router(demo_router, prefix="/api/v1")
+
 
 
 @app.get("/")
