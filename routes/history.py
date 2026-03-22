@@ -115,10 +115,6 @@ async def search_conversations(
     q: str = Query(..., min_length=1),
     user_id: str = Depends(verify_token)
 ):
-    """
-    Search through conversation titles and message content.
-    Returns matching conversations with relevant message snippets.
-    """
     try:
         if not q or not q.strip():
             return []
@@ -126,7 +122,6 @@ async def search_conversations(
         query = q.strip().lower()
         client = get_supabase()
 
-        # search conversation titles
         title_results = (
             client.table("conversations")
             .select("id, title, created_at, updated_at")
@@ -137,7 +132,6 @@ async def search_conversations(
             .execute()
         )
 
-        # search message content
         message_results = (
             client.table("messages")
             .select("id, conversation_id, role, content, created_at")
@@ -147,14 +141,11 @@ async def search_conversations(
             .execute()
         )
 
-        # build results map — conversation_id → best snippet
         conv_snippets: dict = {}
-
         for msg in (message_results.data or []):
             conv_id = msg["conversation_id"]
             if conv_id not in conv_snippets:
                 content = msg["content"]
-                # find the query position and extract snippet around it
                 idx = content.lower().find(query)
                 if idx != -1:
                     start = max(0, idx - 60)
@@ -169,7 +160,6 @@ async def search_conversations(
                         "role": msg["role"]
                     }
 
-        # fetch conversation details for message matches
         matched_conv_ids = list(conv_snippets.keys())
         message_conv_results = []
 
@@ -185,11 +175,9 @@ async def search_conversations(
                 if conv.data:
                     message_conv_results.append(conv.data[0])
 
-        # merge results — title matches first, then message matches
         seen_ids = set()
         final_results = []
 
-        # add title matches
         for conv in (title_results.data or []):
             if conv["id"] not in seen_ids:
                 seen_ids.add(conv["id"])
@@ -201,7 +189,6 @@ async def search_conversations(
                     "snippet": None
                 })
 
-        # add message matches
         for conv in message_conv_results:
             if conv["id"] not in seen_ids:
                 seen_ids.add(conv["id"])
@@ -288,6 +275,7 @@ async def save_msg(
         if request.role == "assistant":
             all_messages = get_messages(request.conversation_id)
 
+            # auto-generate title after first exchange
             if len(all_messages) == 2:
                 user_msg = next(
                     (m["content"] for m in all_messages if m["role"] == "user"),
@@ -301,6 +289,7 @@ async def save_msg(
                     )
                 )
 
+            # trigger memory extraction every 4th assistant message
             if len(all_messages) % 4 == 0:
                 from routes.memory import extract_memories_from_conversation
                 asyncio.create_task(
@@ -309,6 +298,20 @@ async def save_msg(
                          for m in all_messages],
                         request.conversation_id,
                         user_id
+                    )
+                )
+
+            # trigger conversation scoring every 4th assistant message
+            if len(all_messages) % 4 == 0:
+                from routes.scores import score_conversation
+                asyncio.create_task(
+                    score_conversation(
+                        conversation_id=request.conversation_id,
+                        user_id=user_id,
+                        messages=[
+                            {"role": m["role"], "content": m["content"]}
+                            for m in all_messages
+                        ]
                     )
                 )
 
