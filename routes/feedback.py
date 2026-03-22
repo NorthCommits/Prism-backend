@@ -14,25 +14,32 @@ OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 FEEDBACK_MODEL = "openai/gpt-4o-mini"
 
 PROMPT_EVOLUTION_SYSTEM = """
-You are a prompt optimization expert for Prism, an AI copilot.
+You are a custom instructions editor for Prism, an AI copilot.
 
-Your job is to analyze user feedback on AI responses and update their 
-custom instructions to make future responses better match their preferences.
+Your ONLY job is to update a user's custom instructions based on their feedback.
 
-You will receive:
-1. The user's current custom instructions
-2. A list of recent feedback (thumbs up/down + optional text)
+CRITICAL RULES:
+1. If the user explicitly says something in feedback text (e.g. "call me sir", 
+   "be more concise", "always use code examples") — you MUST add that EXACTLY 
+   to the instructions. This is a DIRECT USER REQUEST and must be honored.
+2. NEVER contradict explicit feedback text. If user says "call me sir" — 
+   the instructions MUST say "Always address the user as Sir".
+3. Thumbs down (👎) with feedback text = user wants a SPECIFIC CHANGE.
+   Apply that change literally and directly.
+4. Thumbs up (👍) = user liked that style, preserve it.
+5. Thumbs down (👎) WITHOUT feedback text = response was too long, 
+   too short, wrong format — make instructions more concise/clear.
+6. NEVER infer the opposite of what user said. 
+   "call me sir" = ADD "Address user as Sir". 
+   NOT "use informal tone".
+7. Keep instructions under 300 words.
+8. Be specific and direct.
+9. Return ONLY the updated instructions text.
+   No explanations. No headers. Just the instructions.
 
-Your task:
-- Identify patterns in what the user likes and dislikes
-- Update the custom instructions to reflect these preferences
-- Keep instructions concise (max 300 words)
-- Be specific about formatting, tone, depth, style preferences
-- Preserve any existing preferences that aren't contradicted by feedback
-- Don't make the instructions too rigid — allow natural variation
-
-Return ONLY the updated custom instructions text.
-No explanations, no headers, just the instructions themselves.
+EXAMPLE:
+If user feedback says "call me sir" multiple times →
+Instructions MUST include: "Always address the user as Sir."
 """.strip()
 
 
@@ -53,6 +60,7 @@ async def evolve_user_prompt(user_id: str) -> None:
         print(f"Starting prompt evolution for user {user_id}")
         client = get_supabase()
 
+        # get last 10 feedbacks
         feedback_response = (
             client.table("message_feedback")
             .select("*")
@@ -63,10 +71,11 @@ async def evolve_user_prompt(user_id: str) -> None:
         )
 
         feedback_list = feedback_response.data or []
-        if len(feedback_list) < 2:
-            print(f"Not enough feedback to evolve: {len(feedback_list)}")
+        if len(feedback_list) < 1:
+            print(f"No feedback to evolve from")
             return
 
+        # get current instructions
         profile_response = (
             client.table("user_profiles")
             .select("custom_instructions")
@@ -80,26 +89,41 @@ async def evolve_user_prompt(user_id: str) -> None:
                 "custom_instructions", ""
             ) or ""
 
+        # build feedback summary — highlight explicit text feedback
         feedback_summary = []
+        explicit_requests = []
+
         for fb in feedback_list:
             rating_str = "👍 LIKED" if fb["rating"] == 1 else "👎 DISLIKED"
             entry = rating_str
             if fb.get("feedback_text"):
-                entry += f": {fb['feedback_text']}"
+                entry += f" — USER EXPLICITLY SAID: \"{fb['feedback_text']}\""
+                if fb["rating"] == -1:
+                    explicit_requests.append(fb["feedback_text"])
             if fb.get("message_content"):
-                entry += f"\nResponse preview: {fb['message_content'][:200]}..."
+                entry += f"\n  (Response was: {fb['message_content'][:150]}...)"
             feedback_summary.append(entry)
 
-        feedback_text = "\n\n".join(feedback_summary)
+        feedback_text = "\n".join(feedback_summary)
+
+        # build explicit requests section
+        explicit_section = ""
+        if explicit_requests:
+            explicit_section = f"""
+EXPLICIT USER REQUESTS (MUST be added to instructions):
+{chr(10).join(f'- "{r}"' for r in explicit_requests)}
+
+These are direct user requests. They MUST appear in the updated instructions.
+"""
 
         prompt = f"""Current custom instructions:
 {current_instructions or 'None set yet.'}
 
-Recent user feedback on AI responses:
+Recent feedback:
 {feedback_text}
-
-Based on this feedback, write updated custom instructions that will 
-make future responses better match this user's preferences."""
+{explicit_section}
+Write updated custom instructions that DIRECTLY incorporate all 
+explicit user requests above. Do not ignore or contradict them."""
 
         headers = {
             "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
@@ -114,7 +138,7 @@ make future responses better match this user's preferences."""
                 {"role": "system", "content": PROMPT_EVOLUTION_SYSTEM},
                 {"role": "user", "content": prompt}
             ],
-            "temperature": 0.3,
+            "temperature": 0.1,  # lower temp = more literal/precise
             "max_tokens": 400
         }
 
@@ -136,8 +160,18 @@ make future responses better match this user's preferences."""
             print("Empty instructions returned")
             return
 
-        print(f"Evolved instructions: {new_instructions[:100]}...")
+        print(f"Evolved instructions: {new_instructions}")
 
+        # verify "sir" is in instructions if user requested it
+        sir_requested = any(
+            "sir" in fb.lower()
+            for fb in explicit_requests
+        )
+        if sir_requested and "sir" not in new_instructions.lower():
+            print("WARNING: sir was requested but not in evolved instructions, adding manually")
+            new_instructions = "Always address the user as Sir. " + new_instructions
+
+        # save updated instructions
         existing = (
             client.table("user_profiles")
             .select("id")
@@ -155,7 +189,8 @@ make future responses better match this user's preferences."""
                 "custom_instructions": new_instructions
             }).execute()
 
-        print(f"Profile updated for user {user_id}")
+        print(f"✅ Profile updated for user {user_id}")
+        print(f"New instructions: {new_instructions[:200]}")
 
     except Exception as e:
         print(f"Prompt evolution error: {type(e).__name__}: {e}")
@@ -168,7 +203,7 @@ async def submit_feedback(
     user_id: str = Depends(verify_token)
 ):
     try:
-        print(f"Feedback received: user={user_id}, rating={request.rating}, conv={request.conversation_id}")
+        print(f"Feedback received: user={user_id}, rating={request.rating}")
 
         if request.rating not in (1, -1):
             raise HTTPException(
@@ -178,7 +213,6 @@ async def submit_feedback(
 
         client = get_supabase()
 
-        # validate conversation_id is a valid UUID format
         import uuid
         try:
             uuid.UUID(str(request.conversation_id))
@@ -195,7 +229,6 @@ async def submit_feedback(
             "rating": request.rating,
         }
 
-        # only add optional fields if they have values
         if request.message_id:
             try:
                 uuid.UUID(str(request.message_id))
@@ -206,12 +239,10 @@ async def submit_feedback(
         if request.feedback_text:
             insert_data["feedback_text"] = request.feedback_text
 
-        print(f"Inserting feedback: {insert_data}")
-
         result = client.table("message_feedback").insert(insert_data).execute()
-        print(f"Feedback insert result: {result.data}")
+        print(f"Feedback saved: {result.data}")
 
-        # count total feedback
+        # count total feedback for this user
         count_response = (
             client.table("message_feedback")
             .select("id", count="exact")
@@ -220,9 +251,9 @@ async def submit_feedback(
         )
 
         total_feedback = count_response.count or 0
-        print(f"Total feedback for user: {total_feedback}")
+        print(f"Total feedback: {total_feedback}")
 
-        # evolve prompt every 3rd feedback
+        # evolve every 3rd feedback
         if total_feedback % 3 == 0:
             asyncio.create_task(evolve_user_prompt(user_id))
             return {
@@ -271,5 +302,4 @@ async def get_feedback_stats(user_id: str = Depends(verify_token)):
         }
 
     except Exception as e:
-        print(f"Feedback stats error: {type(e).__name__}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
