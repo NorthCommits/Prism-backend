@@ -294,6 +294,7 @@ async def chat(request: ChatRequest):
                 system_prompt += "\n\n" + CUSTOM_INSTRUCTIONS_ADDENDUM.format(
                     profile_context=profile_context
                 )
+                print(f"System prompt snippet: {system_prompt[-300:]}")
 
     # inject cross-conversation memories if user_id provided
     if request.user_id:

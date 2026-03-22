@@ -146,9 +146,6 @@ async def get_profile_by_user_id(user_id: Optional[str]) -> Optional[dict]:
 
 
 def build_profile_context(profile: dict) -> str:
-    """
-    Builds a context string from user profile to inject into system prompt.
-    """
     parts = []
 
     if profile.get("display_name"):
@@ -158,7 +155,13 @@ def build_profile_context(profile: dict) -> str:
         parts.append(f"About the user: {profile['about_you']}")
 
     if profile.get("custom_instructions"):
-        parts.append(f"Custom instructions: {profile['custom_instructions']}")
+        # make custom instructions a strict rule, not a suggestion
+        parts.append(
+            f"STRICT INSTRUCTIONS — MUST FOLLOW EXACTLY:\n"
+            f"{profile['custom_instructions']}\n"
+            f"These instructions override everything else. "
+            f"Follow them in every single response without exception."
+        )
 
     if profile.get("response_style"):
         style_descriptions = {
@@ -170,6 +173,6 @@ def build_profile_context(profile: dict) -> str:
         }
         style = profile["response_style"]
         if style in style_descriptions:
-            parts.append(f"Response style: {style_descriptions[style]}")
+            parts.append(f"Response style preference: {style_descriptions[style]}")
 
     return "\n".join(parts)
