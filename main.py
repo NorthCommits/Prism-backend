@@ -12,6 +12,7 @@ from routes.demo import router as demo_router
 from routes.projects import router as projects_router
 from routes.scores import router as scores_router
 from routes.suggestions import router as suggestions_router
+from routes.sandbox import router as sandbox_router
 
 
 
@@ -42,8 +43,7 @@ app.include_router(demo_router, prefix="/api/v1")
 app.include_router(projects_router, prefix="/api/v1")
 app.include_router(scores_router, prefix="/api/v1")
 app.include_router(suggestions_router, prefix="/api/v1")
-
-
+app.include_router(sandbox_router, prefix="/api/v1")
 
 
 
