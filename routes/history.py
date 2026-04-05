@@ -1,4 +1,5 @@
 from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi.responses import Response
 from pydantic import BaseModel
 from typing import Optional
 from db.conversations import (
@@ -11,10 +12,12 @@ from db.conversations import (
 from db.messages import save_message, get_messages
 from db.auth import verify_token
 from db.supabase import get_supabase
+from datetime import datetime
 import asyncio
 import httpx
 import os
 import json
+import re
 
 router = APIRouter()
 
@@ -92,6 +95,44 @@ async def generate_conversation_title(
         print(f"Title generation error: {e}")
 
 
+def format_datetime(dt_str: str) -> str:
+    """Format ISO datetime to readable string."""
+    try:
+        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+        return dt.strftime("%B %d, %Y at %I:%M %p UTC")
+    except Exception:
+        return dt_str
+
+
+def strip_markdown_for_txt(text: str) -> str:
+    """Strip markdown syntax for plain text export."""
+    # remove code blocks (keep content)
+    text = re.sub(r'```[\w]*\n', '', text)
+    text = re.sub(r'```', '', text)
+    # remove inline code
+    text = re.sub(r'`([^`]+)`', r'\1', text)
+    # remove headers (keep text)
+    text = re.sub(r'#{1,6}\s+', '', text)
+    # remove bold and italic (keep text)
+    text = re.sub(r'\*{1,3}([^*]+)\*{1,3}', r'\1', text)
+    text = re.sub(r'_{1,3}([^_]+)_{1,3}', r'\1', text)
+    # remove links (keep label)
+    text = re.sub(r'\[([^\]]+)\]\([^\)]+\)', r'\1', text)
+    # remove horizontal rules
+    text = re.sub(r'\n---+\n', '\n', text)
+    # clean up extra whitespace
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+def build_safe_filename(title: str, ext: str) -> str:
+    """Build a safe filename from conversation title."""
+    safe = re.sub(r'[^\w\s-]', '', title)
+    safe = re.sub(r'[\s]+', '_', safe.strip())
+    safe = safe[:50]
+    return f"prism_{safe}.{ext}"
+
+
 class CreateConversationRequest(BaseModel):
     title: str
     model_id: str = "auto"
@@ -109,6 +150,373 @@ class SaveMessageRequest(BaseModel):
     file_used: bool = False
     file_name: Optional[str] = None
 
+
+# ═══════════════════════════════════════
+# EXPORT ENDPOINT
+# ═══════════════════════════════════════
+
+@router.get("/conversations/{conversation_id}/export")
+async def export_conversation(
+    conversation_id: str,
+    format: str = Query("md", regex="^(md|txt|json)$"),
+    user_id: str = Depends(verify_token)
+):
+    """
+    Export a conversation as Markdown, plain text, or JSON.
+    Returns a downloadable file.
+    """
+    try:
+        # verify ownership
+        conv = get_conversation(conversation_id, user_id)
+        if not conv:
+            raise HTTPException(
+                status_code=404,
+                detail="Conversation not found"
+            )
+
+        messages = get_messages(conversation_id)
+        if not messages:
+            raise HTTPException(
+                status_code=404,
+                detail="No messages found in this conversation"
+            )
+
+        title = conv.get("title", "Conversation")
+        created_at = conv.get("created_at", "")
+        exported_at = datetime.utcnow().isoformat()
+        message_count = len(messages)
+
+        print(f"Exporting conversation '{title}' "
+              f"as {format} ({message_count} messages)")
+
+        # ── JSON ──────────────────────────────────────
+        if format == "json":
+            export_data = {
+                "id": conversation_id,
+                "title": title,
+                "created_at": created_at,
+                "exported_at": exported_at,
+                "exported_by": "Prism AI Copilot",
+                "message_count": message_count,
+                "messages": [
+                    {
+                        "role": m["role"],
+                        "content": m["content"],
+                        "created_at": m.get("created_at", ""),
+                        "routed_to": m.get("routed_to"),
+                        "routing_reason": m.get("routing_reason"),
+                        "search_used": m.get("search_used", False),
+                        "search_query": m.get("search_query"),
+                        "file_used": m.get("file_used", False),
+                        "file_name": m.get("file_name")
+                    }
+                    for m in messages
+                ]
+            }
+
+            content = json.dumps(export_data, indent=2, ensure_ascii=False)
+            filename = build_safe_filename(title, "json")
+
+            return Response(
+                content=content.encode("utf-8"),
+                media_type="application/json",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Content-Length": str(len(content.encode("utf-8")))
+                }
+            )
+
+        # ── MARKDOWN ───────────────────────────────────
+        if format == "md":
+            lines = []
+
+            # header
+            lines.append(f"# {title}")
+            lines.append("")
+            lines.append(f"> Exported from Prism AI Copilot")
+            if created_at:
+                lines.append(f"> Created: {format_datetime(created_at)}")
+            lines.append(f"> Exported: {format_datetime(exported_at)}")
+            lines.append(f"> Messages: {message_count}")
+            lines.append("")
+            lines.append("---")
+            lines.append("")
+
+            # messages
+            for msg in messages:
+                role = msg["role"]
+                content_text = msg["content"]
+                msg_time = msg.get("created_at", "")
+
+                if role == "user":
+                    lines.append("### You")
+                else:
+                    routed = msg.get("routed_to", "")
+                    search = msg.get("search_used", False)
+                    label = "### Prism"
+                    meta_parts = []
+                    if routed:
+                        meta_parts.append(f"routed to {routed}")
+                    if search:
+                        meta_parts.append("web search used")
+                    if meta_parts:
+                        label += f" _{' · '.join(meta_parts)}_"
+                    lines.append(label)
+
+                if msg_time:
+                    lines.append(
+                        f"*{format_datetime(msg_time)}*"
+                    )
+                lines.append("")
+                lines.append(content_text)
+                lines.append("")
+                lines.append("---")
+                lines.append("")
+
+            # footer
+            lines.append(
+                "_Exported from [Prism AI Copilot]"
+                "(https://prism-frontend-three.vercel.app)_"
+            )
+
+            content = "\n".join(lines)
+            filename = build_safe_filename(title, "md")
+
+            return Response(
+                content=content.encode("utf-8"),
+                media_type="text/markdown",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Content-Length": str(len(content.encode("utf-8")))
+                }
+            )
+
+        # ── PLAIN TEXT ─────────────────────────────────
+        if format == "txt":
+            lines = []
+
+            # header
+            lines.append(title.upper())
+            lines.append("=" * min(len(title), 60))
+            lines.append("")
+            lines.append("Exported from Prism AI Copilot")
+            if created_at:
+                lines.append(f"Created:  {format_datetime(created_at)}")
+            lines.append(f"Exported: {format_datetime(exported_at)}")
+            lines.append(f"Messages: {message_count}")
+            lines.append("")
+            lines.append("-" * 60)
+            lines.append("")
+
+            # messages
+            for i, msg in enumerate(messages, 1):
+                role = msg["role"]
+                content_text = strip_markdown_for_txt(msg["content"])
+                msg_time = msg.get("created_at", "")
+
+                if role == "user":
+                    lines.append("YOU:")
+                else:
+                    routed = msg.get("routed_to", "")
+                    search = msg.get("search_used", False)
+                    label = "PRISM:"
+                    meta = []
+                    if routed:
+                        meta.append(f"routed to {routed}")
+                    if search:
+                        meta.append("web search")
+                    if meta:
+                        label += f" [{', '.join(meta)}]"
+                    lines.append(label)
+
+                if msg_time:
+                    lines.append(f"[{format_datetime(msg_time)}]")
+
+                lines.append("")
+                lines.append(content_text)
+                lines.append("")
+                lines.append("-" * 60)
+                lines.append("")
+
+            # footer
+            lines.append(
+                "Exported from Prism AI Copilot — "
+                "https://prism-frontend-three.vercel.app"
+            )
+
+            content = "\n".join(lines)
+            filename = build_safe_filename(title, "txt")
+
+            return Response(
+                content=content.encode("utf-8"),
+                media_type="text/plain",
+                headers={
+                    "Content-Disposition": f'attachment; filename="{filename}"',
+                    "Content-Length": str(len(content.encode("utf-8")))
+                }
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Export error: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ═══════════════════════════════════════
+# BRANCH ENDPOINT
+# ═══════════════════════════════════════
+
+class BranchConversationRequest(BaseModel):
+    message_index: int  # branch from this message index (inclusive)
+
+
+@router.post("/conversations/{conversation_id}/branch")
+async def branch_conversation(
+    conversation_id: str,
+    request: BranchConversationRequest,
+    user_id: str = Depends(verify_token)
+):
+    """
+    Creates a new conversation branched from
+    an existing one up to a specific message index.
+    """
+    try:
+        client = get_supabase()
+
+        # verify ownership
+        conv = get_conversation(conversation_id, user_id)
+        if not conv:
+            raise HTTPException(
+                status_code=404,
+                detail="Conversation not found"
+            )
+
+        # get all messages
+        messages = get_messages(conversation_id)
+        if not messages:
+            raise HTTPException(
+                status_code=404,
+                detail="No messages found"
+            )
+
+        # validate message index
+        if request.message_index < 0 or \
+           request.message_index >= len(messages):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid message index. "
+                       f"Valid range: 0-{len(messages)-1}"
+            )
+
+        # slice messages up to branch point (inclusive)
+        branch_messages = messages[:request.message_index + 1]
+        branch_point_msg = messages[request.message_index]
+
+        original_title = conv.get("title", "Conversation")
+        branch_title = f"Branch: {original_title}"
+
+        print(f"Branching '{original_title}' "
+              f"at message {request.message_index} "
+              f"({len(branch_messages)} messages)")
+
+        # create new conversation
+        new_conv = client.table("conversations").insert({
+            "user_id": user_id,
+            "title": branch_title,
+            "model_id": conv.get("model_id", "auto"),
+            "parent_conversation_id": conversation_id,
+            "branch_point_message_id": branch_point_msg.get("id"),
+            "is_branch": True
+        }).execute()
+
+        if not new_conv.data:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to create branch conversation"
+            )
+
+        new_conv_id = new_conv.data[0]["id"]
+
+        # copy messages to new conversation
+        for msg in branch_messages:
+            client.table("messages").insert({
+                "conversation_id": new_conv_id,
+                "role": msg["role"],
+                "content": msg["content"],
+                "model_id": msg.get("model_id"),
+                "routed_to": msg.get("routed_to"),
+                "routing_reason": msg.get("routing_reason"),
+                "search_used": msg.get("search_used", False),
+                "search_query": msg.get("search_query"),
+                "file_used": msg.get("file_used", False),
+                "file_name": msg.get("file_name")
+            }).execute()
+
+        print(f"Branch created: {new_conv_id} "
+              f"with {len(branch_messages)} messages")
+
+        return {
+            "success": True,
+            "branch_conversation_id": new_conv_id,
+            "branch_title": branch_title,
+            "message_count": len(branch_messages),
+            "parent_conversation_id": conversation_id
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Branch error: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/conversations/{conversation_id}/branches")
+async def get_conversation_branches(
+    conversation_id: str,
+    user_id: str = Depends(verify_token)
+):
+    """
+    Returns all branches of a conversation.
+    """
+    try:
+        client = get_supabase()
+
+        # verify ownership
+        conv = get_conversation(conversation_id, user_id)
+        if not conv:
+            raise HTTPException(
+                status_code=404,
+                detail="Conversation not found"
+            )
+
+        response = (
+            client.table("conversations")
+            .select("id, title, created_at, updated_at, "
+                    "is_branch, branch_point_message_id")
+            .eq("parent_conversation_id", conversation_id)
+            .eq("user_id", user_id)
+            .order("created_at", desc=False)
+            .execute()
+        )
+
+        return response.data or []
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+
+
+
+
+# ═══════════════════════════════════════
+# EXISTING ENDPOINTS (unchanged)
+# ═══════════════════════════════════════
 
 @router.get("/search")
 async def search_conversations(
@@ -236,7 +644,10 @@ async def get_conv(
     try:
         conv = get_conversation(conversation_id, user_id)
         if not conv:
-            raise HTTPException(status_code=404, detail="Conversation not found")
+            raise HTTPException(
+                status_code=404,
+                detail="Conversation not found"
+            )
         return conv
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -275,7 +686,6 @@ async def save_msg(
         if request.role == "assistant":
             all_messages = get_messages(request.conversation_id)
 
-            # auto-generate title after first exchange
             if len(all_messages) == 2:
                 user_msg = next(
                     (m["content"] for m in all_messages if m["role"] == "user"),
@@ -289,7 +699,6 @@ async def save_msg(
                     )
                 )
 
-            # trigger memory extraction every 4th assistant message
             if len(all_messages) % 4 == 0:
                 from routes.memory import extract_memories_from_conversation
                 asyncio.create_task(
@@ -301,11 +710,23 @@ async def save_msg(
                     )
                 )
 
-            # trigger conversation scoring every 4th assistant message
             if len(all_messages) % 4 == 0:
                 from routes.scores import score_conversation
                 asyncio.create_task(
                     score_conversation(
+                        conversation_id=request.conversation_id,
+                        user_id=user_id,
+                        messages=[
+                            {"role": m["role"], "content": m["content"]}
+                            for m in all_messages
+                        ]
+                    )
+                )
+
+            if len(all_messages) % 4 == 0:
+                from routes.suggestions import store_conversation_embedding
+                asyncio.create_task(
+                    store_conversation_embedding(
                         conversation_id=request.conversation_id,
                         user_id=user_id,
                         messages=[
