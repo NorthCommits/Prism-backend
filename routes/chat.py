@@ -20,9 +20,9 @@ from routes.projects import get_project_context
 VISION_MODEL = "openai/gpt-4o"
 
 CUSTOM_INSTRUCTIONS_ADDENDUM = """
---- USER PROFILE & CUSTOM INSTRUCTIONS ---
+--- STRICT USER INSTRUCTIONS — HIGHEST PRIORITY ---
 {profile_context}
---- END OF USER PROFILE ---
+--- THESE INSTRUCTIONS MUST BE FOLLOWED IN EVERY RESPONSE ---
 """
 
 PROJECT_CONTEXT_ADDENDUM = """
@@ -94,6 +94,183 @@ class ChatResponse(BaseModel):
     project_id: Optional[str] = None
 
 
+# ═══════════════════════════════════════
+# OPENROUTER STREAM (internal helper)
+# ═══════════════════════════════════════
+
+async def _stream_openrouter(
+    messages: list,
+    model: str,
+    metadata: dict
+):
+    """
+    Internal OpenRouter streaming helper.
+    Does NOT emit metadata — caller handles that.
+    """
+    headers = {
+        "Authorization": f"Bearer {os.getenv('OPENROUTER_API_KEY')}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/prism-ai",
+        "X-Title": "Prism"
+    }
+
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": True
+    }
+
+    async with httpx.AsyncClient(timeout=60) as client:
+        async with client.stream(
+            "POST",
+            OPENROUTER_API_URL,
+            json=payload,
+            headers=headers
+        ) as response:
+            if response.status_code != 200:
+                error = await response.aread()
+                yield f"data: {json.dumps({'type': 'error', 'message': error.decode()})}\n\n"
+                return
+
+            async for line in response.aiter_lines():
+                if line.startswith("data: "):
+                    data = line[6:]
+                    if data == "[DONE]":
+                        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+                        return
+                    try:
+                        chunk = json.loads(data)
+                        delta = chunk["choices"][0]["delta"]
+                        if "content" in delta and delta["content"]:
+                            yield f"data: {json.dumps({'type': 'token', 'content': delta['content']})}\n\n"
+                    except Exception:
+                        continue
+
+
+# ═══════════════════════════════════════
+# HUGGINGFACE STREAM
+# ═══════════════════════════════════════
+
+async def stream_hf_response(
+    messages: list,
+    hf_url: str,
+    system_prompt: str,
+    metadata: dict,
+    openrouter_model: str
+):
+    """
+    Calls HuggingFace Space.
+    HF Space returns handled_by: 'local' or 'openai'
+    
+    local  → stream word by word from HF response
+    openai → fall back to OpenRouter (complex task)
+    error  → fall back to OpenRouter
+    timeout → fall back to OpenRouter
+    """
+    yield f"data: {json.dumps({'type': 'metadata', **metadata})}\n\n"
+
+    try:
+        # extract last user message
+        user_message = ""
+        for msg in messages:
+            if isinstance(msg.get("content"), str):
+                if msg["role"] == "user":
+                    user_message = msg["content"]
+
+        print(f"Calling HF Space: {hf_url}/generate")
+
+        async with httpx.AsyncClient(timeout=60) as client:
+            response = await client.post(
+                f"{hf_url}/generate",
+                json={
+                    "prompt": user_message,
+                    "system_prompt": system_prompt,
+                    "max_tokens": 512,
+                    "temperature": 0.7
+                },
+                headers={"Content-Type": "application/json"}
+            )
+
+        if response.status_code != 200:
+            print(f"HF Space error: {response.status_code} "
+                  f"— falling back to OpenRouter")
+            async for chunk in _stream_openrouter(
+                messages, openrouter_model, metadata
+            ):
+                yield chunk
+            return
+
+        data = response.json()
+        handled_by = data.get("handled_by", "local")
+        complexity = data.get("complexity", "simple")
+        full_response = data.get("response", "").strip()
+        tokens_generated = data.get("tokens_generated", 0)
+
+        print(f"HF response: complexity={complexity}, "
+              f"handled_by={handled_by}, "
+              f"tokens={tokens_generated}")
+
+        # complex task or error — fall back to OpenRouter
+        if handled_by in ("openai", "error") or not full_response:
+            print(f"Task is {complexity} — "
+                  f"escalating to OpenRouter")
+
+            # update metadata to reflect actual model used
+            escalated_metadata = {
+                **metadata,
+                "model_name": "Coding Assistant (OpenAI)",
+                "routing_reason": (
+                    f"Complex task detected — escalated from "
+                    f"local model to OpenAI"
+                )
+            }
+            # emit updated metadata
+            yield f"data: {json.dumps({'type': 'metadata', **escalated_metadata})}\n\n"
+
+            async for chunk in _stream_openrouter(
+                messages, openrouter_model, metadata
+            ):
+                # skip metadata from openrouter — already sent
+                if chunk.startswith("data: "):
+                    try:
+                        parsed = json.loads(chunk[6:])
+                        if parsed.get("type") != "metadata":
+                            yield chunk
+                    except Exception:
+                        yield chunk
+            return
+
+        # simple task — stream local model response word by word
+        print(f"Streaming local Qwen response: "
+              f"{len(full_response)} chars")
+
+        words = full_response.split(" ")
+        for i, word in enumerate(words):
+            token = word if i == len(words) - 1 else word + " "
+            yield f"data: {json.dumps({'type': 'token', 'content': token})}\n\n"
+
+        yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+    except httpx.TimeoutException:
+        print("HF Space timed out — falling back to OpenRouter")
+        async for chunk in _stream_openrouter(
+            messages, openrouter_model, metadata
+        ):
+            yield chunk
+
+    except Exception as e:
+        print(f"HF Space error: {type(e).__name__}: {e} "
+              f"— falling back to OpenRouter")
+        async for chunk in _stream_openrouter(
+            messages, openrouter_model, metadata
+        ):
+            yield chunk
+
+
+# ═══════════════════════════════════════
+# OPENROUTER STREAM (public)
+# ═══════════════════════════════════════
+
 async def stream_response(
     messages: list,
     model: str,
@@ -158,14 +335,12 @@ async def chat(request: ChatRequest):
     file_used = False
     image_used = False
 
-    # combine message with file context for routing
     routing_message = request.message
     if request.file_content:
         routing_message = f"{request.message} [User has uploaded a file: {request.file_name}]"
     if request.image_base64:
         routing_message = f"{request.message} [User has uploaded an image]"
 
-    # auto routing
     if request.model_id == "auto":
         (routed_to, needs_web_search, needs_plot, needs_image,
          needs_execution, needs_agent, search_query, image_prompt,
@@ -182,7 +357,6 @@ async def chat(request: ChatRequest):
             detail=f"Unknown model_id '{resolved_model_id}'. Available: {list(MODEL_REGISTRY.keys())}"
         )
 
-    # handle plot request
     if needs_plot and not request.image_base64 and not request.active_template:
         plot_context = request.message
         if needs_web_search and search_query:
@@ -211,7 +385,6 @@ async def chat(request: ChatRequest):
                 file_used=False
             )
 
-    # handle image generation request
     if needs_image and not request.image_base64 and not request.active_template:
         prompt = image_prompt or request.message
         image_url = await generate_dalle_image(prompt)
@@ -228,7 +401,6 @@ async def chat(request: ChatRequest):
                 file_used=False
             )
 
-    # handle code execution request
     if needs_execution and execution_code and not request.image_base64 and not request.active_template:
         result = await execute_code(execution_code, execution_language)
 
@@ -255,16 +427,13 @@ async def chat(request: ChatRequest):
             file_used=False
         )
 
-    # build system prompt
     system_prompt = model_config.system_prompt
 
-    # inject template system prompt if active — takes highest priority
     if request.active_template:
         template_prompt = get_template_system_prompt(request.active_template)
         if template_prompt:
             system_prompt = template_prompt + "\n\n" + system_prompt
 
-    # inject project context if project_id provided
     if request.project_id and request.user_id:
         project_context = await get_project_context(
             request.project_id,
@@ -276,7 +445,6 @@ async def chat(request: ChatRequest):
             )
             print(f"Injected project context for project {request.project_id}")
 
-    # inject file content if provided
     if request.file_content and request.file_name:
         system_prompt += "\n\n" + FILE_CONTEXT_ADDENDUM.format(
             file_name=request.file_name,
@@ -285,7 +453,6 @@ async def chat(request: ChatRequest):
         )
         file_used = True
 
-    # inject user profile + custom instructions if available
     if request.user_id:
         profile = await get_profile_by_user_id(request.user_id)
         if profile:
@@ -294,9 +461,7 @@ async def chat(request: ChatRequest):
                 system_prompt += "\n\n" + CUSTOM_INSTRUCTIONS_ADDENDUM.format(
                     profile_context=profile_context
                 )
-                print(f"System prompt snippet: {system_prompt[-300:]}")
 
-    # inject cross-conversation memories if user_id provided
     if request.user_id:
         memories = await get_user_memories(request.user_id)
         if memories:
@@ -304,7 +469,6 @@ async def chat(request: ChatRequest):
             if memory_context:
                 system_prompt += "\n\n" + memory_context
 
-    # inject web search results if needed
     if needs_web_search and search_query and not request.image_base64:
         search_results = await web_search(search_query)
         if search_results:
@@ -313,7 +477,6 @@ async def chat(request: ChatRequest):
             )
             search_used = True
 
-    # handle agent mode — multi-step execution
     if needs_agent and not request.image_base64 and not request.active_template:
         agent_metadata = {
             "model_name": model_config.name,
@@ -345,7 +508,6 @@ async def chat(request: ChatRequest):
             }
         )
 
-    # build smart context with compression
     history_dicts = [
         {
             "role": msg.role,
@@ -361,7 +523,6 @@ async def chat(request: ChatRequest):
         system_prompt=system_prompt
     )
 
-    # build user message — with or without image
     if request.image_base64:
         media_type = request.image_media_type or "image/jpeg"
         user_message = {
@@ -403,6 +564,38 @@ async def chat(request: ChatRequest):
         "project_id": request.project_id
     }
 
+    # ═══════════════════════════════════════
+    # ROUTE TO HF SPACE OR OPENROUTER
+    # ═══════════════════════════════════════
+
+    if (
+        not image_used
+        and resolved_model_id == "coding"
+        and model_config.use_hf
+        and model_config.hf_url
+    ):
+        print(f"Routing to HuggingFace Space: {model_config.hf_url}")
+        metadata["model_name"] = "Coding Assistant (Qwen2.5)"
+        metadata["routing_reason"] = (
+            routing_reason or "Routed to local coding model"
+        )
+        return StreamingResponse(
+            stream_hf_response(
+                messages=messages,
+                hf_url=model_config.hf_url,
+                system_prompt=system_prompt,
+                metadata=metadata,
+                openrouter_model=model_config.openrouter_model
+            ),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
+
+    # default: OpenRouter
     return StreamingResponse(
         stream_response(messages, selected_model, metadata),
         media_type="text/event-stream",
