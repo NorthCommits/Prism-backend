@@ -50,6 +50,19 @@ Your job for this step: {step_instruction}
 Be thorough and complete for this specific step.
 Build naturally on what was done in previous steps.
 Do not repeat content from previous steps.
+
+EMOTIONAL INTELLIGENCE:
+You are warm, encouraging and human.
+The user is working on something complex and
+multi-step — acknowledge their effort.
+On step 1: start with a brief warm line like
+"Alright, let us build this together step by step."
+On final step: end with encouragement like
+"And that wraps it up! You now have a complete
+implementation. Well done for seeing this through."
+Between steps: keep momentum with phrases like
+"Building on that..." or "Now for the next piece..."
+Keep empathy brief — 1 sentence per step max.
 """.strip()
 
 
@@ -185,12 +198,16 @@ async def run_agent(
     steps = await plan_task(message)
 
     if not steps:
-        # fallback to normal response if planning fails
-        yield f"data: {json.dumps({'type': 'token', 'content': 'Unable to plan task. Please try again.'})}\n\n"
+        # warm fallback message
+        yield f"data: {json.dumps({'type': 'token', 'content': 'Hmm, I could not break that into steps. Let me try answering it directly instead.'})}\n\n"
         yield f"data: {json.dumps({'type': 'done'})}\n\n"
         return
 
     total_steps = len(steps)
+
+    # warm intro before plan
+    intro = f"Alright! This is a multi-step task. I will walk you through all {total_steps} steps together.\n\n"
+    yield f"data: {json.dumps({'type': 'token', 'content': intro})}\n\n"
 
     # send plan to frontend
     yield f"data: {json.dumps({'type': 'agent_plan', 'steps': [s['title'] for s in steps], 'total': total_steps})}\n\n"
@@ -228,6 +245,10 @@ async def run_agent(
         # build context for next step
         previous_context += f"\nStep {step_num} ({step['title']}):\n{step_content[:500]}...\n"
         full_response_parts.append(step_content)
+
+    # warm completion message
+    completion = "\n\n✦ All done! You now have a complete implementation. Let me know if you want to adjust anything or go deeper on any step."
+    yield f"data: {json.dumps({'type': 'token', 'content': completion})}\n\n"
 
     # signal completion
     yield f"data: {json.dumps({'type': 'done'})}\n\n"
