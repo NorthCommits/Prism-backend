@@ -13,7 +13,7 @@ from routes.sandbox import execute_code
 from routes.context import build_smart_context
 from routes.profile import get_profile_by_user_id, build_profile_context
 from routes.memory import get_user_memories, build_memory_context
-from routes.agent import run_agent
+# from routes.agent import run_agent
 from routes.templates import get_template_system_prompt
 from routes.projects import get_project_context
 
@@ -328,7 +328,7 @@ async def chat(request: ChatRequest):
     needs_plot = False
     needs_image = False
     needs_execution = False
-    needs_agent = False
+    # needs_agent = False
     image_prompt = ""
     execution_code = ""
     execution_language = "python"
@@ -343,8 +343,8 @@ async def chat(request: ChatRequest):
 
     if request.model_id == "auto":
         (routed_to, needs_web_search, needs_plot, needs_image,
-         needs_execution, needs_agent, search_query, image_prompt,
-         execution_code, execution_language, routing_reason) = await route_message(routing_message)
+        needs_execution, _, search_query, image_prompt,
+        execution_code, execution_language, routing_reason) = await route_message(routing_message)
         resolved_model_id = routed_to
     else:
         resolved_model_id = request.model_id
@@ -477,36 +477,36 @@ async def chat(request: ChatRequest):
             )
             search_used = True
 
-    if needs_agent and not request.image_base64 and not request.active_template:
-        agent_metadata = {
-            "model_name": model_config.name,
-            "model_id": resolved_model_id,
-            "response_type": "text",
-            "routed_to": routed_to,
-            "routing_reason": routing_reason,
-            "search_used": False,
-            "search_query": None,
-            "file_used": file_used,
-            "image_used": False,
-            "is_agent": True,
-            "active_template": request.active_template,
-            "project_id": request.project_id
-        }
+    # if needs_agent and not request.image_base64 and not request.active_template:
+    #     agent_metadata = {
+    #         "model_name": model_config.name,
+    #         "model_id": resolved_model_id,
+    #         "response_type": "text",
+    #         "routed_to": routed_to,
+    #         "routing_reason": routing_reason,
+    #         "search_used": False,
+    #         "search_query": None,
+    #         "file_used": file_used,
+    #         "image_used": False,
+    #         "is_agent": True,
+    #         "active_template": request.active_template,
+    #         "project_id": request.project_id
+    #     }
 
-        return StreamingResponse(
-            run_agent(
-                message=request.message,
-                system_prompt=system_prompt,
-                specialist=model_config.name,
-                metadata=agent_metadata
-            ),
-            media_type="text/event-stream",
-            headers={
-                "Cache-Control": "no-cache",
-                "Connection": "keep-alive",
-                "X-Accel-Buffering": "no"
-            }
-        )
+    #     return StreamingResponse(
+    #         run_agent(
+    #             message=request.message,
+    #             system_prompt=system_prompt,
+    #             specialist=model_config.name,
+    #             metadata=agent_metadata
+    #         ),
+    #         media_type="text/event-stream",
+    #         headers={
+    #             "Cache-Control": "no-cache",
+    #             "Connection": "keep-alive",
+    #             "X-Accel-Buffering": "no"
+    #         }
+    #     )
 
     history_dicts = [
         {
@@ -559,7 +559,7 @@ async def chat(request: ChatRequest):
         "search_query": search_query if search_used else None,
         "file_used": file_used,
         "image_used": image_used,
-        "is_agent": False,
+        # "is_agent": False,
         "active_template": request.active_template,
         "project_id": request.project_id
     }

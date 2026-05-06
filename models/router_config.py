@@ -7,7 +7,7 @@ Your job is to analyze the user's message and decide:
 3. Whether the user wants a data plot/chart
 4. Whether the user wants an AI-generated image
 5. Whether the user wants to execute/run code
-6. Whether the task is complex enough to need multi-step agent mode
+# 6. Whether the task is complex enough to need multi-step agent mode
 
 Available models:
 - coding: Best for code generation, debugging, code review, technical explanations, algorithms, data structures, programming questions, data analysis
@@ -75,7 +75,7 @@ Respond ONLY with a valid JSON object in this exact format:
   "needs_plot": true or false,
   "needs_image": true or false,
   "needs_execution": true or false,
-  "needs_agent": true or false,
+  # "needs_agent": true or false,
   "search_query": "specific search query here or empty string if not needed",
   "image_prompt": "detailed image generation prompt or empty string if not needed",
   "execution_code": "the code to execute or empty string if not needed",
