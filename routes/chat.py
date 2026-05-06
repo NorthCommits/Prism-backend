@@ -343,8 +343,9 @@ async def chat(request: ChatRequest):
 
     if request.model_id == "auto":
         (routed_to, needs_web_search, needs_plot, needs_image,
-        needs_execution, _, search_query, image_prompt,
+        needs_execution, search_query, image_prompt,
         execution_code, execution_language, routing_reason) = await route_message(routing_message)
+
         resolved_model_id = routed_to
     else:
         resolved_model_id = request.model_id
