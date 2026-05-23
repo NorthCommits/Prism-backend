@@ -154,6 +154,7 @@ MODEL_REGISTRY: Dict[str, ModelConfig] = {
         name="Coding Assistant",
         description="Specialized for code generation, debugging, and technical problems.",
         openrouter_model="openai/gpt-4o-mini",
+        # openrouter_model="google/gemma-4-31b-it:free",
         hf_url=os.getenv("CODING_LLM_URL", ""),
         use_hf=bool(os.getenv("CODING_LLM_URL", "")),
         system_prompt=(

@@ -16,6 +16,7 @@ from routes.memory import get_user_memories, build_memory_context
 # from routes.agent import run_agent
 from routes.templates import get_template_system_prompt
 from routes.projects import get_project_context
+from routes.guardrails import check_message, get_blocked_response
 
 VISION_MODEL = "openai/gpt-4o"
 
@@ -320,6 +321,47 @@ async def stream_response(
 
 @router.post("/chat")
 async def chat(request: ChatRequest):
+
+
+
+    safety = await check_message(request.message)
+    if not safety["is_safe"]:
+        blocked_msg = get_blocked_response(
+            safety["category"],
+            safety["severity"]
+        )
+        print(f"Guardrail blocked: {safety['category']} "
+              f"({safety['severity']}) — {safety['reason']}")
+
+        async def blocked_stream():
+            yield f"data: {json.dumps({'type': 'metadata', 'model_name': 'Prism', 'model_id': 'safety', 'response_type': 'text', 'routed_to': None, 'routing_reason': 'Safety check', 'search_used': False, 'file_used': False, 'image_used': False, 'active_template': None, 'project_id': None})}\n\n"
+            yield f"data: {json.dumps({'type': 'token', 'content': blocked_msg})}\n\n"
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+        return StreamingResponse(
+            blocked_stream(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    
     routed_to = None
     routing_reason = None
     search_used = False
